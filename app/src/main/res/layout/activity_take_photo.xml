@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <SurfaceView
+        android:id="@+id/camera_surfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <RelativeLayout
+
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="20dp">
+
+
+        <co.jp.snjp.x264demo.view.ShutterButton
+            android:id="@+id/btn_takePhoto"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_centerInParent="true" />
+
+        <ImageButton
+            android:onClick="config"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_toRightOf="@id/btn_takePhoto"
+            android:background="@null"
+            android:src="@drawable/setting" />
+
+        <ImageButton
+            android:id="@+id/confirm"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_alignParentRight="true"
+            android:layout_centerVertical="true"
+            android:background="@null"
+            android:onClick="confirm"
+            android:src="@drawable/confirm_style"
+            android:visibility="invisible" />
+
+        <ImageButton
+            android:id="@+id/cancel"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_alignParentLeft="true"
+            android:layout_centerVertical="true"
+            android:background="@null"
+            android:onClick="cancel"
+            android:src="@drawable/cancel_style"
+            android:visibility="invisible" />
+
+    </RelativeLayout>
+
+
+</RelativeLayout>

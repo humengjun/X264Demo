@@ -1,0 +1,531 @@
+package co.jp.snjp.x264demo.encode;
+
+import android.annotation.TargetApi;
+import android.media.Image;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
+import android.os.Build;
+import android.util.Log;
+
+import java.io.File;
+import java.nio.ByteBuffer;
+
+import co.jp.snjp.x264demo.encode.exception.DecoderCreateException;
+import co.jp.snjp.x264demo.encode.exception.DecoderDecodeException;
+import co.jp.snjp.x264demo.encode.utils.FileUtils;
+import co.jp.snjp.x264demo.encode.utils.H264SPSParser;
+import co.jp.snjp.x264demo.encode.utils.ImageConvertTools;
+import co.jp.snjp.x264demo.encode.utils.ImageHelper;
+
+public class ImageDecoder {
+
+    private MediaCodec mMediaCodec;
+
+    private MediaFormat mMediaFormat;
+
+    private int cacheFrameCount;
+
+    private boolean isFirstFrame = true;
+
+    private int generateIndex = 0;
+
+    private final int DEFAULT_FRAMERATE = 1;
+
+    private final int DEFAULT_WIDTH = 0;
+
+    private final int DEFAULT_HEIGHT = 0;
+
+    private boolean isI420;
+
+    private boolean isNew;
+
+    private int width = DEFAULT_WIDTH;
+
+    private int height = DEFAULT_HEIGHT;
+
+    private String mimeType;
+
+    private int color_format;
+
+    //返回的图像类型
+    public static final int TYPE_YUV = 0;
+    public static final int TYPE_JPG = 1;
+    public static final int TYPE_BMP = 2;
+
+
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public ImageDecoder(String mimeType) throws DecoderCreateException {
+        try {
+            this.mimeType = mimeType;
+//            mMediaCodec = MediaCodec.createDecoderByType(mimeType);
+            color_format = getSupportColorFormat();
+//            mMediaFormat = MediaFormat.createVideoFormat(mimeType, width, height);
+//            mMediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, color_format);
+//
+//            mMediaCodec.configure(mMediaFormat, null, null, 0);
+//            mMediaCodec.start();
+            isFirstFrame = true;
+            cacheFrameCount = 0;
+            generateIndex = 0;
+        } catch (Exception e) {
+            throw new DecoderCreateException();
+        }
+    }
+
+    /**
+     * 获取支持的颜色格式
+     *
+     * @return
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    private int getSupportColorFormat() {
+        int numCodecs = MediaCodecList.getCodecCount();
+        MediaCodecInfo codecInfo = null;
+        for (int i = 0; i < numCodecs && codecInfo == null; i++) {
+            MediaCodecInfo info = MediaCodecList.getCodecInfoAt(i);
+            if (!info.isEncoder()) {
+                continue;
+            }
+            String[] types = info.getSupportedTypes();
+            boolean found = false;
+            for (int j = 0; j < types.length && !found; j++) {
+                if (types[j].equals("video/avc")) {
+                    System.out.println("found");
+                    found = true;
+                }
+            }
+            if (!found)
+                continue;
+            codecInfo = info;
+        }
+
+        // Find a color profile that the codec supports
+        if (codecInfo == null)
+            return 0;
+        MediaCodecInfo.CodecCapabilities capabilities = codecInfo.getCapabilitiesForType("video/avc");
+
+        if (isNew) {
+            //优先使用新版本的API，兼容性差，解码效果更好
+            for (int i = 0; i < capabilities.colorFormats.length; i++) {
+
+                switch (capabilities.colorFormats[i]) {
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible:
+                        isI420 = true;
+                        return capabilities.colorFormats[i];
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar:
+                        return capabilities.colorFormats[i];
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar:
+                        isI420 = true;
+                        return capabilities.colorFormats[i];
+                    default:
+                        Log.d("AvcEncoder", "other color format " + capabilities.colorFormats[i]);
+                        break;
+                }
+            }
+        } else {
+            //优先使用旧版本API，兼容性强，解码效果较差(背景是灰色)
+            for (int i = capabilities.colorFormats.length - 1; i >= 0; i--) {
+
+                switch (capabilities.colorFormats[i]) {
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible:
+                        isI420 = true;
+                        return capabilities.colorFormats[i];
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar:
+                        return capabilities.colorFormats[i];
+                    case MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar:
+                        isI420 = true;
+                        return capabilities.colorFormats[i];
+                    default:
+                        Log.d("AvcEncoder", "other color format " + capabilities.colorFormats[i]);
+                        break;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * 解码一张图片
+     *
+     * @param file
+     * @param isReset 是否重置解码器
+     * @return
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public byte[] decoderFile(File file, boolean isReset) throws Exception {
+        byte[] h264Data = FileUtils.readFile4Bytes(file);
+        if (h264Data == null)
+            return null;
+
+        int[] w_h_data = {width, height};
+        H264SPSParser.obtainH264ImageSize(h264Data, w_h_data);
+        int width = w_h_data[0];
+        int height = w_h_data[1];
+
+        if (this.width != width || this.height != height)
+            resetDecoder(width, height);
+        else if (isReset)
+            resetDecoder(width, height);
+
+        int yuvSize = width * height * 3 / 2;
+        byte[] yuvData = null;
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+        //针对某些设备会缓存几帧再解码，因此需要判断是否是第一帧并记录缓存的帧数。
+        if (isFirstFrame) {
+            while (true) {
+                if (mMediaCodec != null) {
+                    int inputBufferIndex = mMediaCodec.dequeueInputBuffer(-1);
+                    int flag = MediaCodec.BUFFER_FLAG_KEY_FRAME;
+                    if (inputBufferIndex >= 0) {
+                        ByteBuffer inputBuffer = null;
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                            inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
+                        } else {
+                            inputBuffer = mMediaCodec.getInputBuffers()[inputBufferIndex];
+                        }
+                        if (inputBuffer != null) {
+                            inputBuffer.clear();
+                            inputBuffer.put(h264Data);
+                            mMediaCodec.queueInputBuffer(inputBufferIndex, 0, h264Data.length, computePresentationTime(generateIndex), flag);
+                            cacheFrameCount++;
+                            generateIndex++;
+                        }
+                    }
+
+                    int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                    while (outputBufferIndex >= 0) {
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP &&
+                                color_format != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+                            //COLOR_FormatYUV420Flexible颜色格式不支持此方法解码
+                            Image image = mMediaCodec.getOutputImage(outputBufferIndex);
+                            if (image != null) {
+                                yuvData = ImageHelper.getDataFromImage(image, ImageHelper.COLOR_FormatI420);
+                                isI420 = true;
+                            }
+                        } else {
+                            ByteBuffer outputBuffer = null;
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                outputBuffer = mMediaCodec.getOutputBuffer(outputBufferIndex);
+                            } else {
+                                outputBuffer = mMediaCodec.getOutputBuffers()[outputBufferIndex];
+                            }
+                            if (outputBuffer != null && bufferInfo.size >= yuvSize) {
+                                yuvData = new byte[yuvSize];
+                                outputBuffer.get(yuvData, 0, yuvData.length);
+                            }
+                        }
+
+                        cacheFrameCount--;
+                        mMediaCodec.releaseOutputBuffer(outputBufferIndex, false);
+                        outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                    }
+                    if (yuvData != null) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            //根据缓存的帧数决定解码几帧，取最后一帧
+            for (int i = 0; i < cacheFrameCount + 1; i++) {
+                if (mMediaCodec != null) {
+                    int inputBufferIndex = mMediaCodec.dequeueInputBuffer(-1);
+                    int flag = MediaCodec.BUFFER_FLAG_KEY_FRAME;
+                    if (inputBufferIndex >= 0) {
+                        ByteBuffer inputBuffer = null;
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                            inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
+                        } else {
+                            inputBuffer = mMediaCodec.getInputBuffers()[inputBufferIndex];
+                        }
+                        if (inputBuffer != null) {
+                            inputBuffer.clear();
+                            inputBuffer.put(h264Data);
+                            mMediaCodec.queueInputBuffer(inputBufferIndex, 0, h264Data.length, computePresentationTime(generateIndex), flag);
+                            cacheFrameCount++;
+                            generateIndex++;
+                        }
+                    }
+
+                    int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                    while (outputBufferIndex >= 0) {
+
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP &&
+                                color_format != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+                            Image image = mMediaCodec.getOutputImage(outputBufferIndex);
+                            if (image != null) {
+                                yuvData = ImageHelper.getDataFromImage(image, ImageHelper.COLOR_FormatI420);
+                                isI420 = true;
+                            }
+                        } else {
+                            ByteBuffer outputBuffer = null;
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                outputBuffer = mMediaCodec.getOutputBuffer(outputBufferIndex);
+                            } else {
+                                outputBuffer = mMediaCodec.getOutputBuffers()[outputBufferIndex];
+                            }
+                            if (outputBuffer != null && bufferInfo.size >= yuvSize) {
+                                yuvData = new byte[yuvSize];
+                                outputBuffer.get(yuvData, 0, yuvData.length);
+                            }
+                        }
+
+                        cacheFrameCount--;
+                        mMediaCodec.releaseOutputBuffer(outputBufferIndex, false);
+                        outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                    }
+                }
+            }
+        }
+
+        isFirstFrame = false;
+        if (!isI420 && yuvData != null) {
+            yuvData = ImageConvertTools.NV12toI420(yuvData);
+        }
+        return yuvData;
+    }
+
+    /**
+     * 解码一张图片
+     *
+     * @param fileData
+     * @param isReset  是否重置解码器
+     * @return
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    private byte[] decoderData(byte[] fileData, boolean isReset) throws DecoderCreateException, DecoderDecodeException {
+        byte[] h264Data = fileData;
+        int width = 0;
+        int height = 0;
+        try {
+            int[] w_h_data = {width, height};
+            H264SPSParser.obtainH264ImageSize(h264Data, w_h_data);
+            width = w_h_data[0];
+            height = w_h_data[1];
+        } catch (Exception e) {
+            throw new DecoderDecodeException();
+        }
+        if (width <= 0 || height <= 0)
+            throw new DecoderDecodeException();
+
+        if (this.width != width || this.height != height)
+            resetDecoder(width, height);
+        else if (isReset)
+            resetDecoder(width, height);
+
+        int yuvSize = width * height * 3 / 2;
+        byte[] yuvData = null;
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+        //针对某些设备会缓存几帧再解码，因此需要判断是否是第一帧并记录缓存的帧数。
+        try {
+            if (isFirstFrame) {
+                while (true) {
+                    if (mMediaCodec != null) {
+                        int inputBufferIndex = mMediaCodec.dequeueInputBuffer(-1);
+                        int flag = MediaCodec.BUFFER_FLAG_KEY_FRAME;
+                        if (inputBufferIndex >= 0) {
+                            ByteBuffer inputBuffer = null;
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
+                            } else {
+                                inputBuffer = mMediaCodec.getInputBuffers()[inputBufferIndex];
+                            }
+                            if (inputBuffer != null) {
+                                inputBuffer.clear();
+                                inputBuffer.put(h264Data);
+                                mMediaCodec.queueInputBuffer(inputBufferIndex, 0, h264Data.length, computePresentationTime(generateIndex), flag);
+                                cacheFrameCount++;
+                                generateIndex++;
+                            }
+                        }
+
+                        int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                        while (outputBufferIndex >= 0) {
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP &&
+                                    color_format != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+                                //COLOR_FormatYUV420Flexible颜色格式不支持此方法解码
+                                Image image = mMediaCodec.getOutputImage(outputBufferIndex);
+                                if (image != null) {
+                                    yuvData = ImageHelper.getDataFromImage(image, ImageHelper.COLOR_FormatI420);
+                                    isI420 = true;
+                                }
+                            } else {
+                                ByteBuffer outputBuffer = null;
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                    outputBuffer = mMediaCodec.getOutputBuffer(outputBufferIndex);
+                                } else {
+                                    outputBuffer = mMediaCodec.getOutputBuffers()[outputBufferIndex];
+                                }
+                                if (outputBuffer != null && bufferInfo.size >= yuvSize) {
+                                    yuvData = new byte[yuvSize];
+                                    outputBuffer.get(yuvData, 0, yuvData.length);
+                                }
+                            }
+
+                            cacheFrameCount--;
+                            mMediaCodec.releaseOutputBuffer(outputBufferIndex, false);
+                            outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                        }
+                        if (yuvData != null) {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                //根据缓存的帧数决定解码几帧，取最后一帧
+                for (int i = 0; i < cacheFrameCount + 1; i++) {
+                    if (mMediaCodec != null) {
+                        int inputBufferIndex = mMediaCodec.dequeueInputBuffer(-1);
+                        int flag = MediaCodec.BUFFER_FLAG_KEY_FRAME;
+                        if (inputBufferIndex >= 0) {
+                            ByteBuffer inputBuffer = null;
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
+                            } else {
+                                inputBuffer = mMediaCodec.getInputBuffers()[inputBufferIndex];
+                            }
+                            if (inputBuffer != null) {
+                                inputBuffer.clear();
+                                inputBuffer.put(h264Data);
+                                mMediaCodec.queueInputBuffer(inputBufferIndex, 0, h264Data.length, computePresentationTime(generateIndex), flag);
+                                cacheFrameCount++;
+                                generateIndex++;
+                            }
+                        }
+
+                        int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                        while (outputBufferIndex >= 0) {
+
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP &&
+                                    color_format != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+                                Image image = mMediaCodec.getOutputImage(outputBufferIndex);
+                                if (image != null) {
+                                    yuvData = ImageHelper.getDataFromImage(image, ImageHelper.COLOR_FormatI420);
+                                    isI420 = true;
+                                }
+                            } else {
+                                ByteBuffer outputBuffer = null;
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                    outputBuffer = mMediaCodec.getOutputBuffer(outputBufferIndex);
+                                } else {
+                                    outputBuffer = mMediaCodec.getOutputBuffers()[outputBufferIndex];
+                                }
+                                if (outputBuffer != null && bufferInfo.size >= yuvSize) {
+                                    yuvData = new byte[yuvSize];
+                                    outputBuffer.get(yuvData, 0, yuvData.length);
+                                }
+                            }
+
+                            cacheFrameCount--;
+                            mMediaCodec.releaseOutputBuffer(outputBufferIndex, false);
+                            outputBufferIndex = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+                        }
+                    }
+                }
+            }
+
+            isFirstFrame = false;
+            if (!isI420 && yuvData != null) {
+                yuvData = ImageConvertTools.NV12toI420(yuvData);
+            }
+        } catch (Exception e) {
+            throw new DecoderDecodeException();
+        }
+        return yuvData;
+    }
+
+    public byte[] decodeImage(byte[] fileData, int type) throws DecoderDecodeException, DecoderCreateException {
+        byte[] data = decoderData(fileData, false);
+        try {
+            switch (type) {
+                case TYPE_YUV:
+                    break;
+                case TYPE_JPG:
+                    data = ImageConvertTools.I420ToJpeg(data, width, height);
+                    break;
+                case TYPE_BMP:
+                    data = ImageConvertTools.I420ToBmp(data, width, height);
+                    break;
+            }
+        } catch (Exception e) {
+            throw new DecoderDecodeException();
+        } finally {
+            release();
+        }
+        return data;
+    }
+
+
+    public byte[] decodeImage(File file, int type) throws DecoderDecodeException, DecoderCreateException {
+        byte[] fileData = FileUtils.readFile4Bytes(file);
+        return decodeImage(fileData, type);
+    }
+
+    /**
+     * 图像宽高变化，需要重新设置解码器
+     *
+     * @param width
+     * @param height
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    private void resetDecoder(int width, int height) throws DecoderCreateException {
+        try {
+            release();
+            this.width = width;
+            this.height = height;
+            mMediaCodec = MediaCodec.createDecoderByType(mimeType);
+            if (mMediaFormat != null) {
+                mMediaFormat.setInteger(MediaFormat.KEY_WIDTH, width);
+                mMediaFormat.setInteger(MediaFormat.KEY_HEIGHT, height);
+
+                mMediaCodec.configure(mMediaFormat, null, null, 0);
+                mMediaCodec.start();
+                isFirstFrame = true;
+                cacheFrameCount = 0;
+                generateIndex = 0;
+            } else {
+                mMediaFormat = MediaFormat.createVideoFormat(mimeType, width, height);
+                mMediaFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, color_format);
+
+                mMediaCodec.configure(mMediaFormat, null, null, 0);
+                mMediaCodec.start();
+                isFirstFrame = true;
+                cacheFrameCount = 0;
+                generateIndex = 0;
+            }
+        } catch (Exception e) {
+            throw new DecoderCreateException();
+        }
+    }
+
+    /**
+     * 停止硬件编码
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public void stopDecoder() {
+        if (mMediaCodec != null) {
+            mMediaCodec.stop();
+        }
+    }
+
+    /**
+     * release all resource that used in Encoder
+     */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
+    public void release() {
+        if (mMediaCodec != null) {
+            mMediaCodec.release();
+            mMediaCodec = null;
+        }
+    }
+
+    /**
+     * Generates the presentation time for frame N, in microseconds.
+     */
+    private long computePresentationTime(long frameIndex) {
+        return 132 + frameIndex * 1000000 / DEFAULT_FRAMERATE;
+    }
+
+}
